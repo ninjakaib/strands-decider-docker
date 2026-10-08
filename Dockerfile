@@ -56,6 +56,9 @@ RUN SETUPTOOLS_SCM_PRETEND_VERSION_FOR_STRANDS_DECIDER=0.1.0+g${DECIDER_COMMIT} 
 FROM deps AS weights
 ARG DECIDER_REPO=StrandsAgents/strands-decider-2B-hobson-v21
 ARG DECIDER_REVISION=main
+# Base-model files the server never reads. The offline check below skips the same files,
+# because an offline snapshot_download otherwise requires every file in the repo.
+ARG BASE_IGNORE='["*.md", "*.bin", "*.pth", "*.gguf", "original/*"]'
 ENV HF_HOME=/models/hf \
     HF_HUB_DISABLE_TELEMETRY=1
 # The checkpoint holds only the LoRA adapter and the pointer head. StrandsDeciderModel.load
@@ -64,11 +67,13 @@ ENV HF_HOME=/models/hf \
 # way load() does at runtime, so the cache holds exactly what the server will ask for.
 RUN <<'EOF'
 python - <<'PY'
+import json
 import os
 
 from huggingface_hub import snapshot_download
 from strands_decider.modeling import StrandsDeciderConfig, base_revision, config_path
 
+BASE_IGNORE = json.loads(os.environ["BASE_IGNORE"])
 ckpt = "/models/strands-decider"
 snapshot_download(
     os.environ["DECIDER_REPO"], revision=os.environ["DECIDER_REVISION"], local_dir=ckpt
@@ -76,11 +81,7 @@ snapshot_download(
 config = StrandsDeciderConfig.from_json(config_path(ckpt))
 revision = base_revision(ckpt, config)
 print(f"base model {config.base_model} at revision {revision or 'main'}")
-snapshot_download(
-    config.base_model,
-    revision=revision,
-    ignore_patterns=["*.md", "*.bin", "*.pth", "*.gguf", "original/*"],
-)
+snapshot_download(config.base_model, revision=revision, ignore_patterns=BASE_IGNORE)
 PY
 rm -rf /models/strands-decider/.cache
 EOF
@@ -88,19 +89,25 @@ EOF
 # downloads disabled; it skips the 2B forward pass because the build runner has no GPU.
 RUN <<'EOF'
 HF_HUB_OFFLINE=1 python - <<'PY'
+import json
+import os
+
 from huggingface_hub import snapshot_download
 from strands_decider.modeling import (
     StrandsDeciderConfig, base_revision, checkpoint_dir, config_path, load_head_state,
 )
 from transformers import AutoConfig, AutoTokenizer
 
+BASE_IGNORE = json.loads(os.environ["BASE_IGNORE"])
 ckpt = checkpoint_dir("/models/strands-decider")
 config = StrandsDeciderConfig.from_json(config_path(ckpt))
 revision = base_revision(ckpt, config)
 load_head_state(ckpt)
 AutoTokenizer.from_pretrained(ckpt)
 AutoConfig.from_pretrained(config.base_model, revision=revision)
-snapshot_download(config.base_model, revision=revision, local_files_only=True)
+snapshot_download(
+    config.base_model, revision=revision, local_files_only=True, ignore_patterns=BASE_IGNORE
+)
 print("offline resolution ok")
 PY
 EOF
