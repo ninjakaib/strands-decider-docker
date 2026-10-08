@@ -1,0 +1,105 @@
+name: Build and push the Strands Decider image
+
+# Builds ../../Dockerfile and pushes it to ghcr.io/<owner>/strands-decider. The runner has no
+# GPU and does not need one: the build installs wheels and downloads weights, and the offline
+# check in the Dockerfile avoids importing the GPU kernels.
+
+on:
+  workflow_dispatch:
+    inputs:
+      decider_repo:
+        description: Hugging Face repo of the decider checkpoint
+        default: StrandsAgents/strands-decider-2B-hobson-v21
+      decider_revision:
+        description: Branch, tag or commit of that repo
+        default: main
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/strands-decider
+  DECIDER_REPO: ${{ inputs.decider_repo || 'StrandsAgents/strands-decider-2B-hobson-v21' }}
+  DECIDER_REVISION: ${{ inputs.decider_revision || 'main' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # The build holds the 6 GB virtualenv twice (deps stage and runtime copy) plus 4.5 GB of
+      # weights and the compressed push. That is more than the ~14 GB a standard runner has
+      # free, so remove preinstalled toolchains this job never uses.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR needs a lowercase name. The model tag is the repo basename, plus the revision
+      # when it is not main: hobson-v21, or hobson-v21-<revision>.
+      - name: Names
+        id: names
+        run: |
+          image="${IMAGE,,}"
+          model="${DECIDER_REPO##*/}"
+          model="${model#strands-decider-2B-}"
+          if [ "$DECIDER_REVISION" != main ]; then model="${model}-${DECIDER_REVISION:0:12}"; fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "model_tag=${model,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.names.outputs.image }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.names.outputs.model_tag }}
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DECIDER_REPO=${{ env.DECIDER_REPO }}
+            DECIDER_REVISION=${{ env.DECIDER_REVISION }}
+          # No layer cache: a cache would store another copy of the 10 GB of layers, and the
+          # image is rebuilt rarely.
+          provenance: false
+
+      - name: Report size
+        env:
+          REF: ${{ steps.names.outputs.image }}:${{ steps.names.outputs.model_tag }}
+        run: |
+          docker buildx imagetools inspect "$REF" --raw \
+            | jq -r '[.layers[].size] | add / 1e9 | "compressed size: \(. * 100 | round / 100) GB"'
